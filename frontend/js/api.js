@@ -372,6 +372,15 @@ const Api = {
         return this.request('/index/api/getAllSession');
     },
 
+    async addProbe(vhost, app, stream, probeMs = 5000) {
+        const params = new URLSearchParams({ vhost, app, stream, probe_ms: probeMs });
+        const response = await fetch(this.getUrl(`/index/api/addProbe?${params.toString()}`), {
+            method: 'GET',
+            credentials: 'include'
+        });
+        return response.json();
+    },
+
     async getSnap(url, timeoutSec = 5, expireSec = 3) {
         // 构建GET请求的查询参数
         const params = new URLSearchParams({

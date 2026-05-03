@@ -379,6 +379,7 @@ async function showStreamInfo(schema, vhost, app, stream) {
                     ${renderStreamInfo(data, vhost, app, stream)}
                 </div>
                 <div class="flex justify-end gap-2 pt-4 mt-2 border-t border-white/10 shrink-0">
+                    <button class="bg-teal-500 text-white px-4 py-2 rounded-lg text-sm font-semibold hover:shadow-neon transition-colors probe-btn" data-vhost="${vhost}" data-app="${app}" data-stream="${stream}"><i class="fa fa-stethoscope mr-1"></i>探针</button>
                     <button class="bg-purple-500 text-white px-4 py-2 rounded-lg text-sm font-semibold hover:shadow-neon transition-colors rec-nav-btn" data-vhost="${vhost}" data-app="${app}" data-stream="${stream}"><i class="fa fa-film mr-1"></i>录像</button>
                     <button class="bg-blue-500 text-white px-4 py-2 rounded-lg text-sm font-semibold hover:shadow-neon transition-colors" onclick="showStreamPlayers('${schema}', '${vhost}', '${app}', '${stream}')"><i class="fa fa-users mr-1"></i>观众</button>
                     <button class="bg-red-500 text-white px-4 py-2 rounded-lg text-sm font-semibold hover:shadow-neon transition-colors" onclick="stopStream('${schema}', '${vhost}', '${app}', '${stream}')"><i class="fa fa-stop mr-1"></i>停止</button>
@@ -390,6 +391,11 @@ async function showStreamInfo(schema, vhost, app, stream) {
         // 录像按钮：通过 data-* 避免引号嵌套问题
         modal.querySelector('.rec-nav-btn')?.addEventListener('click', function() {
             navigateToRecordings(this.dataset.vhost, this.dataset.app, this.dataset.stream);
+        });
+
+        // 探针按钮
+        modal.querySelector('.probe-btn')?.addEventListener('click', function() {
+            showProbeModal(this.dataset.vhost, this.dataset.app, this.dataset.stream);
         });
 
         modal.addEventListener('click', function(e) {
@@ -1148,4 +1154,477 @@ async function stopStream(schema, vhost, app, stream) {
             }
         }
     );
+}
+
+// ══════════════════════════════════════════════════════════
+// 流探针 - 帧数据分析弹窗
+// ══════════════════════════════════════════════════════════
+async function showProbeModal(vhost, app, stream) {
+    const container = document.getElementById('streams-modal-container');
+
+    // 先显示加载中弹窗
+    const modal = document.createElement('div');
+    modal.className = 'absolute inset-0 bg-black/80 overflow-y-auto pointer-events-auto';
+    modal.setAttribute('data-modal', 'probe');
+    modal.innerHTML = `
+        <div class="bg-gray-900 rounded-xl p-6 w-full mx-auto my-8 border border-white/20" style="max-width:1200px;" onclick="event.stopPropagation()">
+            <div class="flex justify-between items-center mb-4">
+                <h3 class="text-xl font-bold text-white"><i class="fa fa-stethoscope mr-2 text-teal-400"></i>流探针分析：${app}/${stream}</h3>
+                <button class="text-white/60 hover:text-white" onclick="this.closest('[data-modal=probe]').remove()">
+                    <i class="fa fa-times text-2xl"></i>
+                </button>
+            </div>
+            <div id="probe-body" class="flex items-center justify-center min-h-32">
+                <div class="text-center text-white/60 py-12">
+                    <div class="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-teal-400 mx-auto mb-4"></div>
+                    <p>正在采集 5 秒帧数据，请稍候…</p>
+                </div>
+            </div>
+        </div>
+    `;
+    container.appendChild(modal);
+    modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
+
+    try {
+        const result = await Api.addProbe(vhost, app, stream, 5000);
+        const body = modal.querySelector('#probe-body');
+        if (result.code !== 0) {
+            body.innerHTML = `<div class="text-red-400 p-6">探针失败：${result.msg || '未知错误'}</div>`;
+            return;
+        }
+        const frames = result.data || [];
+        body.innerHTML = renderProbeAnalysis(frames);
+        bindChartHover(body);
+    } catch (e) {
+        const body = modal.querySelector('#probe-body');
+        body.innerHTML = `<div class="text-red-400 p-6">请求失败：${e.message}</div>`;
+    }
+}
+
+/**
+ * 绑定折线图悬停交互（需在 innerHTML 填充后调用）
+ */
+function bindChartHover(container) {
+    container.querySelectorAll('[id^="pc"]').forEach(svg => {
+        const tip = document.getElementById(svg.id + '-tip');
+        if (!tip) return;
+        const W = parseFloat(svg.getAttribute('viewBox').split(' ')[2]) || 1000;
+        svg.querySelectorAll('.probe-hit').forEach(g => {
+            g.addEventListener('mouseenter', function () {
+                const vline = this.querySelector('.probe-vline');
+                const dot   = this.querySelector('.probe-dot');
+                if (vline) vline.style.display = '';
+                if (dot)   dot.style.display   = '';
+                const tx = parseFloat(this.getAttribute('transform').replace('translate(', ''));
+                tip.textContent = this.dataset.val + ' ms';
+                tip.style.left  = (tx / W * 100).toFixed(2) + '%';
+                tip.style.display = 'block';
+            });
+            g.addEventListener('mouseleave', function () {
+                const vline = this.querySelector('.probe-vline');
+                const dot   = this.querySelector('.probe-dot');
+                if (vline) vline.style.display = 'none';
+                if (dot)   dot.style.display   = 'none';
+                tip.style.display = 'none';
+            });
+        });
+    });
+}
+
+/**
+ * 分析帧数据并渲染分析报告
+ */
+function renderProbeAnalysis(frames) {
+    if (!frames.length) return `<div class="text-white/50 p-6 text-center">未获取到帧数据</div>`;
+
+    // ── 按 codec 分组 ──
+    const groups = {};
+    for (const f of frames) {
+        const key = f.codec;
+        if (!groups[key]) groups[key] = [];
+        groups[key].push(f);
+    }
+
+    const codecKeys = Object.keys(groups);
+
+    // ── 对每个 codec 统计 ──
+    function analyzeGroup(list) {
+        // 去重（有时同一帧有多条记录，config_frame 不同），保留 frame_size 最大的
+        const byDts = {};
+        for (const f of list) {
+            const k = f.dts;
+            if (!byDts[k] || f.frame_size > byDts[k].frame_size) byDts[k] = f;
+        }
+        const uniq = Object.values(byDts).sort((a, b) => a.dts - b.dts);
+
+        // dts 间隔
+        const dtsIntervals = [];
+        for (let i = 1; i < uniq.length; i++) dtsIntervals.push(uniq[i].dts - uniq[i - 1].dts);
+
+        // recv_stamp 间隔（到达间隔）
+        const recvIntervals = [];
+        for (let i = 1; i < uniq.length; i++) recvIntervals.push(uniq[i].recv_stamp - uniq[i - 1].recv_stamp);
+
+        // pts - dts 偏移
+        const ptsDtsOffsets = uniq.map(f => f.pts - f.dts);
+
+        function stats(arr) {
+            if (!arr.length) return { min: 0, max: 0, avg: 0, stddev: 0, p95: 0 };
+            const sorted = [...arr].sort((a, b) => a - b);
+            const avg = arr.reduce((s, v) => s + v, 0) / arr.length;
+            const variance = arr.reduce((s, v) => s + (v - avg) ** 2, 0) / arr.length;
+            return {
+                min: sorted[0],
+                max: sorted[sorted.length - 1],
+                avg: avg.toFixed(2),
+                stddev: Math.sqrt(variance).toFixed(2),
+                p95: sorted[Math.floor(sorted.length * 0.95)] ?? sorted[sorted.length - 1],
+            };
+        }
+
+        const dtsStats  = stats(dtsIntervals);
+        const recvStats = stats(recvIntervals);
+        const ptsStats  = stats(ptsDtsOffsets);
+        const keyFrames = uniq.filter(f => f.key_frame).length;
+        const totalBytes = uniq.reduce((s, f) => s + f.frame_size, 0);
+        const duration = uniq.length > 1 ? uniq[uniq.length - 1].dts - uniq[0].dts : 0;
+        const fps = duration > 0 ? ((uniq.length / duration) * 1000).toFixed(2) : 'N/A';
+
+        // 平滑度评分（stddev/avg 越小越平滑）
+        function smoothScore(s) {
+            if (!s.avg || s.avg == 0) return '—';
+            const ratio = s.stddev / s.avg;
+            if (ratio < 0.05) return '<span class="text-green-400 font-bold">优秀</span>';
+            if (ratio < 0.15) return '<span class="text-yellow-400 font-bold">良好</span>';
+            if (ratio < 0.30) return '<span class="text-orange-400 font-bold">一般</span>';
+            return '<span class="text-red-400 font-bold">抖动</span>';
+        }
+
+        return { uniq, dtsStats, recvStats, ptsStats, keyFrames, totalBytes, duration, fps, smoothScore };
+    }
+
+    // ── 音视频交织分析 ──
+    function interleaveScore(allFrames) {
+        if (codecKeys.length < 2) return null;
+        // 按 recv_stamp 排序，检查音视频是否交替出现
+        const sorted = [...allFrames].sort((a, b) => a.recv_stamp - b.recv_stamp);
+        let runs = 0, prev = null;
+        for (const f of sorted) {
+            const type = f.track_type ? f.track_type.toLowerCase() : (f.index === 65535 ? 'audio' : 'video');
+            if (type !== prev) { runs++; prev = type; }
+        }
+        // runs 越多越好（说明交替越频繁）
+        const ratio = runs / sorted.length;
+        if (ratio > 0.6) return `<span class="text-green-400 font-bold">良好</span>（交织比 ${(ratio * 100).toFixed(0)}%）`;
+        if (ratio > 0.3) return `<span class="text-yellow-400 font-bold">一般</span>（交织比 ${(ratio * 100).toFixed(0)}%）`;
+        return `<span class="text-red-400 font-bold">差</span>（交织比 ${(ratio * 100).toFixed(0)}%）`;
+    }
+
+    const interleave = interleaveScore(frames);
+
+    // ── 渲染每个 codec 的可视化时间线 ──
+    function renderTimeline(uniq, label) {
+        if (uniq.length < 2) return '';
+        const baseTs = uniq[0].dts;
+        const totalDur = uniq[uniq.length - 1].dts - baseTs || 1;
+        const W = 1000;
+        const dots = uniq.map(f => {
+            const x = Math.round(((f.dts - baseTs) / totalDur) * W);
+            const color = f.key_frame ? '#34d399' : (f.config_frame ? '#60a5fa' : '#a78bfa');
+            const tip = `dts=${f.dts} pts=${f.pts} size=${f.frame_size}B key=${f.key_frame}`;
+            return `<circle cx="${x}" cy="12" r="${f.key_frame ? 5 : 3}" fill="${color}" opacity="0.85"><title>${tip}</title></circle>`;
+        }).join('');
+        return `
+            <div class="mt-3">
+                <div class="text-xs text-white/50 mb-1">${label} 帧时间线
+                    <span class="ml-3 text-green-400">● 关键帧</span>
+                    <span class="ml-2 text-blue-400">● 配置帧</span>
+                    <span class="ml-2 text-purple-400">● 普通帧</span>
+                </div>
+                <svg width="100%" viewBox="0 0 ${W} 24" style="height:24px;background:rgba(255,255,255,0.04);border-radius:4px;">
+                    <line x1="0" y1="12" x2="${W}" y2="12" stroke="rgba(255,255,255,0.1)" stroke-width="1"/>
+                    ${dots}
+                </svg>
+            </div>
+        `;
+    }
+
+    // ── 生成折线图（通用）──
+    // 全局确保 probe 悬停 tooltip 样式只注入一次
+    if (!document.getElementById('probe-chart-style')) {
+        const s = document.createElement('style');
+        s.id = 'probe-chart-style';
+        s.textContent = `
+            .probe-chart-wrap { position:relative; }
+            .probe-chart-tip {
+                position:absolute; top:-28px; transform:translateX(-50%);
+                background:rgba(15,15,20,0.92); color:#fff;
+                font-size:11px; padding:2px 7px; border-radius:4px;
+                white-space:nowrap; pointer-events:none;
+                border:1px solid rgba(255,255,255,0.15);
+                display:none; z-index:99;
+            }
+            .probe-chart-wrap:hover .probe-chart-tip { display:block; }
+        `;
+        document.head.appendChild(s);
+    }
+
+    // 生成唯一 id 避免多图冲突
+    let _chartId = 0;
+    function renderLineChart(intervals, label, color) {
+        if (intervals.length < 2) return '';
+        const absMax = Math.max(...intervals.map(Math.abs), 1);
+        const W = 1000, H = 40, mid = H / 2;
+        const step = W / (intervals.length - 1 || 1);
+        const id = `pc${++_chartId}`;
+
+        // 折线坐标
+        const pts = intervals.map((v, i) => ({
+            x: i * step,
+            y: mid - (v / absMax) * mid,
+            v
+        }));
+        const pointsAttr = pts.map(p => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ');
+
+        // 每个数据点画一个透明的宽感应矩形 + 竖线（hover 显示）
+        const hitAreas = pts.map((p, i) => {
+            const hw = Math.max(step / 2, 6);
+            return `<g class="probe-hit" data-val="${p.v}" data-idx="${i}"
+                        transform="translate(${p.x.toFixed(1)},0)" style="cursor:crosshair;">
+                <rect x="${(-hw).toFixed(1)}" y="0" width="${(hw * 2).toFixed(1)}" height="${H}"
+                      fill="transparent"/>
+                <line x1="0" y1="0" x2="0" y2="${H}"
+                      stroke="rgba(255,255,255,0.25)" stroke-width="1"
+                      class="probe-vline" style="display:none;"/>
+                <circle cx="0" cy="${p.y.toFixed(1)}" r="3"
+                        fill="${color}" class="probe-dot" style="display:none;"/>
+            </g>`;
+        }).join('');
+
+        return `
+            <div class="mt-3">
+                <div class="text-xs text-white/50 mb-1">${label}</div>
+                <div class="probe-chart-wrap" style="position:relative;">
+                    <div class="probe-chart-tip" id="${id}-tip"></div>
+                    <svg id="${id}" width="100%" viewBox="0 0 ${W} ${H}"
+                         style="height:40px;background:rgba(255,255,255,0.04);border-radius:4px;display:block;">
+                        <line x1="0" y1="${mid}" x2="${W}" y2="${mid}"
+                              stroke="rgba(255,255,255,0.1)" stroke-width="1" stroke-dasharray="4 4"/>
+                        <polyline points="${pointsAttr}" fill="none" stroke="${color}" stroke-width="1.5" opacity="0.85"/>
+                        ${hitAreas}
+                    </svg>
+                </div>
+            </div>
+        `;
+    }
+
+    // ── 整体汇总卡片 ──
+    let summaryCards = codecKeys.map(codec => {
+        const g = analyzeGroup(groups[codec]);
+        const trackType = (groups[codec][0]?.track_type || '').toLowerCase();
+        const isVideo = trackType ? trackType === 'video' : true;
+        const icon = isVideo ? '🎬' : '🎵';
+        return `
+        <div class="bg-white/5 rounded-lg p-4 border border-white/10">
+            <div class="flex items-center justify-between mb-3">
+                <span class="text-white font-bold text-base">${icon} ${codec}</span>
+                <span class="text-white/40 text-xs">${g.uniq.length} 帧 · ${(g.totalBytes / 1024).toFixed(1)} KB · ${g.duration} ms</span>
+            </div>
+            <div class="grid grid-cols-2 gap-x-6 gap-y-1 text-sm">
+                <div class="text-white/50">帧率 / FPS</div>
+                <div class="text-white font-mono">${g.fps}</div>
+                <div class="text-white/50">关键帧数</div>
+                <div class="text-white font-mono">${g.keyFrames}</div>
+
+                <div class="text-white/50 mt-2 col-span-2 border-t border-white/10 pt-2 font-semibold text-white/70">DTS 时间戳间隔（ms）</div>
+                <div class="text-white/50">均值 / 抖动 (σ)</div>
+                <div class="text-white font-mono">${g.dtsStats.avg} / ${g.dtsStats.stddev} ms — 平滑度：${g.smoothScore(g.dtsStats)}</div>
+                <div class="text-white/50">最小 / 最大</div>
+                <div class="text-white font-mono">${g.dtsStats.min} / ${g.dtsStats.max} ms</div>
+
+                <div class="text-white/50 mt-2 col-span-2 border-t border-white/10 pt-2 font-semibold text-white/70">接收间隔（到达抖动）</div>
+                <div class="text-white/50">均值 / 抖动 (σ)</div>
+                <div class="text-white font-mono">${g.recvStats.avg} / ${g.recvStats.stddev} ms — 平滑度：${g.smoothScore(g.recvStats)}</div>
+                <div class="text-white/50">最小 / 最大</div>
+                <div class="text-white font-mono">${g.recvStats.min} / ${g.recvStats.max} ms</div>
+
+                <div class="text-white/50 mt-2 col-span-2 border-t border-white/10 pt-2 font-semibold text-white/70">PTS - DTS 偏移</div>
+                <div class="text-white/50">均值 / 抖动 (σ)</div>
+                <div class="text-white font-mono">${g.ptsStats.avg} / ${g.ptsStats.stddev} ms</div>
+                <div class="text-white/50">最小 / 最大</div>
+                <div class="text-white font-mono">${g.ptsStats.min} / ${g.ptsStats.max} ms</div>
+            </div>
+            ${renderTimeline(g.uniq, codec)}
+            ${renderLineChart(
+                g.uniq.slice(1).map((f, i) => g.uniq[i + 1].dts - g.uniq[i].dts),
+                `${codec} ΔDTS 时间戳间隔抖动（ms）`, '#a78bfa'
+            )}
+            ${renderLineChart(
+                g.uniq.slice(1).map((f, i) => g.uniq[i + 1].recv_stamp - g.uniq[i].recv_stamp),
+                `${codec} ΔRecv 到达间隔抖动（ms）`, '#2dd4bf'
+            )}
+        </div>
+        `;
+    }).join('');
+
+    // ── 音视频 DTS 打点交织图 ──
+    function renderInterleaveChart(allFrames) {
+        if (codecKeys.length < 2) return '';
+
+        // 按 dts 排序，去掉 config_frame（SPS/PPS 等无意义帧）
+        const sorted = allFrames
+            .filter(f => !f.config_frame)
+            .sort((a, b) => a.dts - b.dts);
+        if (sorted.length < 2) return '';
+
+        // 为每个 codec 分配独立 Y 行
+        const tracks = [...new Set(sorted.map(f => f.codec))];
+        const trackY  = {};   // codec → 中心 Y
+        const ROW_H   = 28;   // 每行高度
+        const PAD_TOP = 6;    // 顶部留白
+        const LABEL_W = Math.min(Math.max(...tracks.map(t => t.length)) * 7 + 16, 160);  // 按最长名称动态计算，最大160
+        const W_TOTAL = 1000;
+        const W_CHART = W_TOTAL - LABEL_W; // 打点区宽度
+        tracks.forEach((t, i) => { trackY[t] = PAD_TOP + i * ROW_H + ROW_H / 2; });
+        const H = PAD_TOP + tracks.length * ROW_H + 4;
+
+        const minDts = sorted[0].recv_stamp;
+        const maxDts = sorted[sorted.length - 1].recv_stamp || minDts + 1;
+        const xOf = ts => LABEL_W + ((ts - minDts) / (maxDts - minDts)) * W_CHART;
+
+        // 轨道颜色
+        const COLORS = ['#a78bfa', '#2dd4bf', '#f59e0b', '#f87171', '#34d399', '#60a5fa'];
+        const trackColor = {};
+        tracks.forEach((t, i) => { trackColor[t] = COLORS[i % COLORS.length]; });
+
+        // 横向参考线（仅打点区）
+        const hlines = tracks.map(t => {
+            const y = trackY[t].toFixed(1);
+            return `<line x1="${LABEL_W}" y1="${y}" x2="${W_TOTAL}" y2="${y}" stroke="${trackColor[t]}" stroke-width="0.5" opacity="0.15"/>`;
+        }).join('');
+
+        // 标签区背景分隔线
+        const labelSep = `<line x1="${LABEL_W}" y1="0" x2="${LABEL_W}" y2="${H}" stroke="rgba(255,255,255,0.08)" stroke-width="1"/>`;
+
+        // 帧打点（按 recv_stamp 排序绘制，x 轴为 recv_stamp）
+        const vlines = sorted.map(f => {
+            const x = xOf(f.recv_stamp).toFixed(1);
+            const y = trackY[f.codec];
+            const r = f.key_frame ? 4 : 2.5;
+            const color = trackColor[f.codec];
+            const tip = `[${f.codec}] recv=${f.recv_stamp} dts=${f.dts} size=${f.frame_size}B key=${f.key_frame}`;
+            return `<circle cx="${x}" cy="${y.toFixed(1)}" r="${r}" fill="${color}" opacity="0.75"><title>${tip}</title></circle>`;
+        }).join('');
+
+        // 连接线：recv_stamp 相邻的跨轨道帧连线
+        const byRecv = [...sorted].sort((a, b) => a.recv_stamp - b.recv_stamp);
+        const connLines = [];
+        for (let i = 1; i < byRecv.length; i++) {
+            const a = byRecv[i - 1], b = byRecv[i];
+            if (a.codec !== b.codec) {
+                const x1 = xOf(a.recv_stamp).toFixed(1), y1 = trackY[a.codec].toFixed(1);
+                const x2 = xOf(b.recv_stamp).toFixed(1), y2 = trackY[b.codec].toFixed(1);
+                connLines.push(`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="rgba(255,255,255,0.08)" stroke-width="0.8"/>`);
+            }
+        }
+
+        // 轨道标签（最后绘制，确保在最上层；背景矩形防止文字与点重叠）
+        const labels = tracks.map(t => {
+            const y = trackY[t];
+            const color = trackColor[t];
+            return `
+                <rect x="2" y="${(y - 8).toFixed(1)}" width="${LABEL_W - 6}" height="16" rx="2"
+                      fill="rgba(17,24,39,0.85)"/>
+                <text x="6" y="${(y + 4).toFixed(1)}"
+                      font-size="10" fill="${color}" text-anchor="start"
+                      font-family="monospace">${t}</text>
+            `;
+        }).join('');
+
+        return `
+            <div class="mt-4">
+                <div class="text-xs text-white/50 mb-1">音视频 RecvStamp 交织打点图
+                    <span class="ml-3 text-white/30">X轴=recv_stamp到达时间 · 圆点大=关键帧 · 连线=相邻到达帧跨轨道</span>
+                </div>
+                <svg width="100%" viewBox="0 0 ${W_TOTAL} ${H}"
+                     style="height:${H}px;background:rgba(255,255,255,0.03);border-radius:4px;display:block;">
+                    ${hlines}
+                    ${labelSep}
+                    ${connLines.join('')}
+                    ${vlines}
+                    ${labels}
+                </svg>
+            </div>
+        `;
+    }
+
+    const interleaveRow = interleave ? `
+        <div class="bg-white/5 rounded-lg p-4 border border-white/10">
+            <div class="flex items-center gap-4 mb-3">
+                <span class="text-white/70 font-semibold">🎵🎬 音视频交织性</span>
+                <span>${interleave}</span>
+                <span class="text-white/40 text-xs ml-auto">按 recv_stamp 时序统计音视频交替频率</span>
+            </div>
+            ${renderInterleaveChart(frames)}
+        </div>
+    ` : '';
+
+    // 原始帧表格（折叠）- 计算每个 track（codec）内的 Δdts 和 Δrecv_stamp
+    const trackLastDts = {};
+    const trackLastRecv = {};
+    const rows = frames.map(f => {
+        const codec = f.codec;
+        const deltaDts  = codec in trackLastDts  ? f.dts        - trackLastDts[codec]  : '—';
+        const deltaRecv = codec in trackLastRecv ? f.recv_stamp - trackLastRecv[codec] : '—';
+        trackLastDts[codec]  = f.dts;
+        trackLastRecv[codec] = f.recv_stamp;
+
+        const dtsColor  = (typeof deltaDts  === 'number' && deltaDts  < 0) ? 'text-red-400' : 'text-white';
+        const recvColor = (typeof deltaRecv === 'number' && deltaRecv < 0) ? 'text-red-400'
+                        : (typeof deltaRecv === 'number' && deltaRecv > 200) ? 'text-yellow-400' : 'text-white';
+        return `
+        <tr class="border-b border-white/5 hover:bg-white/5 text-xs">
+            <td class="px-2 py-1 font-mono text-white/70">${f.codec}</td>
+            <td class="px-2 py-1 font-mono">${f.dts}</td>
+            <td class="px-2 py-1 font-mono">${f.pts}</td>
+            <td class="px-2 py-1 font-mono">${f.pts - f.dts}</td>
+            <td class="px-2 py-1 font-mono">${f.recv_stamp}</td>
+            <td class="px-2 py-1 font-mono ${dtsColor}">${deltaDts}</td>
+            <td class="px-2 py-1 font-mono ${recvColor}">${deltaRecv}</td>
+            <td class="px-2 py-1 font-mono">${f.frame_size}</td>
+            <td class="px-2 py-1">${f.key_frame ? '<span class="text-green-400">✓</span>' : ''}</td>
+            <td class="px-2 py-1">${f.config_frame ? '<span class="text-blue-400">✓</span>' : ''}</td>
+        </tr>
+    `}).join('');
+
+    return `
+        <div class="space-y-4 p-1">
+            ${summaryCards}
+            ${interleaveRow}
+            <details class="bg-white/5 rounded-lg border border-white/10">
+                <summary class="px-4 py-3 cursor-pointer text-white/60 text-sm hover:text-white select-none">
+                    <i class="fa fa-table mr-2"></i>原始帧数据（${frames.length} 条）
+                </summary>
+                <div class="overflow-x-auto max-h-64 overflow-y-auto">
+                    <table class="w-full text-white">
+                        <thead class="sticky top-0 bg-gray-900">
+                            <tr class="border-b border-white/10 text-xs text-white/50">
+                                <th class="px-2 py-2 text-left">Codec</th>
+                                <th class="px-2 py-2 text-left">DTS</th>
+                                <th class="px-2 py-2 text-left">PTS</th>
+                                <th class="px-2 py-2 text-left">PTS-DTS</th>
+                                <th class="px-2 py-2 text-left">RecvStamp</th>
+                                <th class="px-2 py-2 text-left">ΔDTS</th>
+                                <th class="px-2 py-2 text-left">ΔRecv</th>
+                                <th class="px-2 py-2 text-left">Size(B)</th>
+                                <th class="px-2 py-2 text-left">KeyFrm</th>
+                                <th class="px-2 py-2 text-left">CfgFrm</th>
+                            </tr>
+                        </thead>
+                        <tbody>${rows}</tbody>
+                    </table>
+                </div>
+            </details>
+        </div>
+    `;
 }
