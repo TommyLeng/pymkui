@@ -4,6 +4,7 @@ Database management module for PyMKUI
 import os
 import sqlite3
 import json
+import threading
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 import config
@@ -12,18 +13,27 @@ import mk_logger
 class Database:
     def __init__(self, db_path: Optional[str] = None):
         self.db_path = db_path if db_path else config.DATABASE_PATH
-        self.connection: sqlite3.Connection
-        self.cursor: sqlite3.Cursor
+        self._local = threading.local()
         self.init_db()
-    
-    def init_db(self):
-        """Initialize database connection"""
-        self.connection = sqlite3.connect(self.db_path, check_same_thread=False)
-        self.connection.row_factory = sqlite3.Row
-        self.cursor = self.connection.cursor()
-        # SQLite 默认不开启外键约束，每次连接后需手动启用
-        self.cursor.execute("PRAGMA foreign_keys = ON")
 
+    def _make_connection(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, check_same_thread=True)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA journal_mode = WAL")
+        return conn
+
+    @property
+    def connection(self) -> sqlite3.Connection:
+        if not hasattr(self._local, 'conn') or self._local.conn is None:
+            self._local.conn = self._make_connection()
+        return self._local.conn
+
+    def init_db(self):
+        """Initialize database and create tables (called once from main thread)."""
+        self._local.conn = self._make_connection()
+        # self.cursor is only used during single-threaded init (_create_tables)
+        self.cursor = self._local.conn.cursor()
         self._create_tables()
     
     def _get_local_timezone(self):
