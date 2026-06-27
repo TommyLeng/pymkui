@@ -234,38 +234,35 @@ const Api = {
     async login(secret, serverUrl) {
         this.setBaseUrl(serverUrl);
 
-        // 1. 检查是否有已保存的 cookie
-        let cookie = this.getCookie();
+        // 1. 每次登录都获取最新的 challenge cookie，避免使用过期的缓存值导致鉴权失败
+        //    （ZLM 的 ZLM_UNLOGIN challenge 仅存活 60 秒，缓存值很容易过期）
+        let cookie = '';
+        const url1 = this.getUrl('/index/api/getApiList');
+        try {
+            const response1 = await fetch(url1, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                credentials: 'include'
+            });
+            const data1 = await response1.json();
 
-        // 2. 如果没有 cookie，调用 getApiList 获取
+            if (data1.code === -100 && data1.cookie) {
+                cookie = data1.cookie;
+                this.setCookie(cookie);
+            } else if (data1.code === 0) {
+                // 已经登录
+                return { success: true, msg: '已登录' };
+            } else {
+                return { success: false, msg: data1.msg || '获取 cookie 失败' };
+            }
+        } catch (error) {
+            return { success: false, msg: '网络请求失败: ' + error.message };
+        }
+
         if (!cookie) {
-            const url1 = this.getUrl('/index/api/getApiList');
-            try {
-                const response1 = await fetch(url1, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    credentials: 'include'
-                });
-                const data1 = await response1.json();
-
-                if (data1.code === -100 && data1.cookie) {
-                    cookie = data1.cookie;
-                    this.setCookie(cookie);
-                } else if (data1.code === 0) {
-                    // 已经登录
-                    return { success: true, msg: '已登录' };
-                } else {
-                    return { success: false, msg: data1.msg || '获取 cookie 失败' };
-                }
-            } catch (error) {
-                return { success: false, msg: '网络请求失败: ' + error.message };
-            }
-
-            if (!cookie) {
-                return { success: false, msg: '获取 cookie 失败' };
-            }
+            return { success: false, msg: '获取 cookie 失败' };
         }
 
         // 3. 计算 digest
