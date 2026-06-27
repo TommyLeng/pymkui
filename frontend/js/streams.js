@@ -984,6 +984,13 @@ async function showStreamPlayers(schema, vhost, app, stream) {
 
 async function getStreamSnap(url, container) {
     try {
+        // Rewrite the host to 127.0.0.1 — url= is used by ZLMediaKit internally,
+        // so loopback guarantees the fast makeSnapInternal path (in-memory GOP cache).
+        try {
+            const u = new URL(url);
+            u.hostname = '127.0.0.1';
+            url = u.toString();
+        } catch (_) {}
         console.log('获取截图:', url);
         
         // 显示加载状态
