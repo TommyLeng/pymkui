@@ -235,9 +235,11 @@ class Database:
         mk_logger.log_info("[Database] 默认插件绑定已初始化")
     
     def close(self):
-        """Close database connection"""
-        if hasattr(self, 'connection') and self.connection:
-            self.connection.close()
+        """Close the calling thread's connection without creating one if absent."""
+        conn = getattr(self._local, 'conn', None)
+        if conn is not None:
+            conn.close()
+            self._local.conn = None
     
     def add_proxy(self, app: str, stream: str, url: str, enabled: bool = True) -> Optional[Dict[str, Any]]:
         """Add a proxy configuration"""
